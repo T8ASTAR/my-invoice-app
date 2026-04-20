@@ -5,143 +5,147 @@ import re
 import os
 from datetime import datetime
 
-# 1. 页面基本配置
-st.set_page_config(page_title="发票持久化管理台账", layout="wide")
+# 1. 页面配置与持久化文件定义
+st.set_page_config(page_title="发票对账管理台账", layout="wide")
+DB_FILE = "invoice_ledger_v2.csv" # 持久化数据库文件
 
-DB_FILE = "invoice_data.csv" # 永久存储文件名
+# 自定义样式：区分“新增”与“老数据”
+st.markdown("""
+    <style>
+    .stMetric { background-color: #fcfcfc; padding: 15px; border-radius: 12px; border: 1px solid #f0f0f0; }
+    .status-new { background-color: #e3f2fd; color: #0d47a1; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+    </style>
+""", unsafe_allow_html=True)
 
-# 2. 数据持久化函数
-def load_db():
-    """从本地文件加载数据"""
+# 2. 数据库读取与保存逻辑
+def load_data():
     if os.path.exists(DB_FILE):
         try:
             df = pd.read_csv(DB_FILE)
-            # 确保金额列是浮点数
-            df['金额'] = df['金额'].astype(float)
-            df['已收'] = df['已收'].astype(float)
             return df.to_dict('records')
-        except:
-            return []
+        except: return []
     return []
 
-def save_db(data_list):
-    """保存数据到本地文件"""
-    if data_list:
-        df = pd.DataFrame(data_list)
-        df.to_csv(DB_FILE, index=False, encoding='utf-8-sig')
+def save_data(data):
+    if data:
+        pd.DataFrame(data).to_csv(DB_FILE, index=False, encoding='utf-8-sig')
 
-# --- 核心解析引擎 ---
-def extract_invoice_info(file):
+# 3. 核心解析引擎（兼容：项目名称/工程名称）
+def parse_pdf(file):
     with pdfplumber.open(file) as pdf:
-        full_text = "".join([p.extract_text() or "" for p in pdf.pages])
-        
+        text = "".join([p.extract_text() or "" for p in pdf.pages])
         try:
-            amt_match = re.search(r"（小写）¥?\s*([\d\.]+)", full_text)
-            amount = float(amt_match.group(1)) if amt_match else 0.0
+            # 金额与日期
+            amt = float(re.search(r"（小写）¥?\s*([\d\.]+)", text).group(1))
+            dt_match = re.search(r"日期\s*[:：]\s*(\d{4})年(\d{2})月(\d{2})日", text)
+            dt = f"{dt_match.group(1)}-{dt_match.group(2)}-{dt_match.group(3)}" if dt_match else "未知日期"
             
-            date_match = re.search(r"日期\s*[:：]\s*(\d{4})年(\d{2})月(\d{2})日", full_text)
-            inv_date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}" if date_match else "未知日期"
-
-            lines = [l.strip() for l in full_text.split('\n') if "名称" in l]
-            buyer, seller = "未知购方", "未知销方"
-            if len(lines) >= 2:
-                buyer = lines[0].split(":")[-1].split("：")[-1].strip()
-                seller = lines[1].split(":")[-1].split("：")[-1].strip()
-
+            # 销方与购方定位
+            lines = [l.strip() for l in text.split('\n') if "名称" in l]
+            buyer = lines[0].split(":")[-1].split("：")[-1].strip() if len(lines) > 0 else "未知购方"
+            seller = lines[1].split(":")[-1].split("：")[-1].strip() if len(lines) > 1 else "未知销方"
+            
+            # 兼容“项目名称”或“工程名称”
             project = "未命名项目"
             for kw in ["项目名称", "工程名称", "项目", "工程"]:
-                p_match = re.search(f"{kw}[:：]\s*([^\n]+)", full_text)
+                p_match = re.search(f"{kw}[:：]\s*([^\n]+)", text)
                 if p_match:
                     raw_p = p_match.group(1).strip()
                     project = re.split(r"项目地址|项目地点|施工地点|工程地址|地址", raw_p)[0].strip(" :,，：")
                     break
+            
+            return {"销方": seller, "购方": buyer, "项目": project, "日期": dt, "金额": amt, "已收": 0.0, "文件名": file.name}
+        except: return None
 
-            return {
-                "销方": seller, "购方": buyer, "项目": project, 
-                "日期": inv_date, "金额": amount, "已收": 0.0, 
-                "文件名": file.name
-            }
-        except Exception:
-            return None
-
-# 3. 初始化或加载数据
+# 4. 初始化
 if 'db' not in st.session_state:
-    st.session_state.db = load_db()
+    st.session_state.db = load_data()
+if 'new_batch' not in st.session_state:
+    st.session_state.new_batch = []
 
-# 4. 侧边栏：操作区
+# 5. 侧边栏：精准查重上传
 with st.sidebar:
-    st.title("📂 档案存储中心")
-    files = st.file_uploader("批量拖入 PDF", type="pdf", accept_multiple_files=True)
+    st.title("📂 归档中心")
+    uploaded_files = st.file_uploader("批量上传 PDF", type="pdf", accept_multiple_files=True)
     
-    if files and st.button("🚀 录入并存档"):
-        new_added = 0
-        for f in files:
-            if not any(d['文件名'] == f.name for d in st.session_state.db):
-                data = extract_invoice_info(f)
-                if data:
-                    st.session_state.db.append(data)
-                    new_added += 1
-        if new_added > 0:
-            save_db(st.session_state.db) # 立即存档
-            st.success(f"已存档 {new_added} 张新发票")
-        else:
-            st.warning("未检测到新发票（已跳过重复文件）")
+    if uploaded_files and st.button("🚀 开始解析并归类"):
+        batch_added = []
+        dups = 0
+        for f in uploaded_files:
+            temp_res = parse_pdf(f)
+            if temp_res:
+                # 【核心逻辑：局部查重】
+                # 只有当 同一个销方(文件夹) 下 已经存在该文件名，才视为重复
+                is_dup = any(d['文件名'] == temp_res['文件名'] and d['销方'] == temp_res['销方'] for d in st.session_state.db)
+                
+                if not is_dup:
+                    st.session_state.db.append(temp_res)
+                    batch_added.append(f.name)
+                else:
+                    dups += 1
+        
+        st.session_state.new_batch = batch_added
+        save_data(st.session_state.db)
+        if batch_added: st.success(f"新增 {len(batch_added)} 张发票")
+        if dups: st.warning(f"跳过当前文件夹已存在的重复件: {dups} 张")
 
     st.divider()
+    # 文件夹式切换
     if st.session_state.db:
-        # 获取所有销方，形成文件夹目录
-        all_sellers = sorted(list(set(d["销方"] for d in st.session_state.db)))
-        current_seller = st.radio("📁 切换销方文件夹", all_sellers)
+        sellers = sorted(list(set(d["销方"] for d in st.session_state.db)))
+        selected_seller = st.radio("📁 销方目录 (文件夹)", sellers)
     else:
-        current_seller = None
+        selected_seller = None
 
-# 5. 主界面
-if current_seller:
-    st.title(f"📁 当前主体：{current_seller}")
-    seller_data = [d for d in st.session_state.db if d["销方"] == current_seller]
+# 6. 主界面展示
+if selected_seller:
+    st.title(f"📁 文件夹：{selected_seller}")
+    # 筛选当前销方
+    current_list = [d for d in st.session_state.db if d["销方"] == selected_seller]
     
-    for buyer in sorted(list(set(d["购方"] for d in seller_data))):
+    # 按购方分组
+    for buyer in sorted(list(set(d["购方"] for d in current_list))):
         with st.expander(f"🤝 客户：{buyer}", expanded=True):
-            invoices = [d for d in seller_data if d["购方"] == buyer]
+            invoices = [d for d in current_list if d["购方"] == buyer]
             
-            # 指标汇总
+            # 客户汇总统计
             t_amt = sum(i["金额"] for i in invoices)
             t_paid = sum(i["已收"] for i in invoices)
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("总金额", f"¥{t_amt:,.2f}")
-            c2.metric("已收", f"¥{t_paid:,.2f}")
-            c3.metric("余款", f"¥{t_amt - t_paid:,.2f}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("累计应收", f"¥{t_amt:,.2f}")
+            m2.metric("已到账", f"¥{t_paid:,.2f}")
+            m3.metric("余款", f"¥{t_amt - t_paid:,.2f}")
             
             st.divider()
             
+            # 项目明细
             for inv in invoices:
-                # 获取该条数据在全局列表中的原始索引，以便修改
-                global_idx = next(i for i, d in enumerate(st.session_state.db) if d['文件名'] == inv['文件名'])
+                # 寻找在全局数据库中的位置以便修改
+                g_idx = next(i for i, d in enumerate(st.session_state.db) if d['文件名'] == inv['文件名'] and d['销方'] == inv['销方'])
+                is_new = inv['文件名'] in st.session_state.new_batch
                 
-                cols = st.columns([3, 2, 2, 1])
-                with cols[0]:
-                    # 允许手动修改识别错的项目名称
-                    new_proj = st.text_input("项目/工程名称", value=inv['项目'], key=f"p_{global_idx}")
-                    st.session_state.db[global_idx]['项目'] = new_proj
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                with c1:
+                    tag = '<span class="status-new">NEW</span>' if is_new else ''
+                    st.markdown(f"**{inv['项目']}** {tag}", unsafe_allow_html=True)
                     st.caption(f"📅 {inv['日期']} | 📄 {inv['文件名']}")
                 
-                with cols[1]:
-                    new_val = st.number_input("到账金额录入", value=inv["已收"], key=f"v_{global_idx}", step=100.0)
+                with c2:
+                    new_val = st.number_input("录入实收", value=float(inv["已收"]), key=f"in_{g_idx}", step=100.0)
                     if new_val != inv["已收"]:
-                        st.session_state.db[global_idx]["已收"] = new_val
-                        save_db(st.session_state.db) # 金额变动自动保存
+                        st.session_state.db[g_idx]["已收"] = new_val
+                        save_data(st.session_state.db) # 自动保存
                 
                 bal = inv["金额"] - new_val
-                with cols[2]:
-                    st.markdown(f"<p style='margin-top:30px; color:{'green' if bal<=0 else 'orange'}'>{'✅ 已结清' if bal<=0 else f'待收: ¥{bal:,.2f}'}</p>", unsafe_allow_html=True)
+                with c3:
+                    st.markdown(f"<p style='margin-top:30px; color:{'#28a745' if bal<=0 else '#f39c12'}'>{'✅ 已结清' if bal<=0 else f'待收: ¥{bal:,.2f}'}</p>", unsafe_allow_html=True)
                 
-                with cols[3]:
+                with c4:
                     st.write(" ")
-                    if st.button("🗑️", key=f"del_{global_idx}"):
-                        st.session_state.db.pop(global_idx)
-                        save_db(st.session_state.db)
+                    if st.button("🗑️", key=f"del_{g_idx}"):
+                        st.session_state.db.pop(g_idx)
+                        save_data(st.session_state.db)
                         st.rerun()
-
 else:
-    st.info("💡 请先在左侧上传 PDF。数据将自动保存至本地 invoice_data.csv 文件中。")
+    st.info("💡 请在左侧上传并解析发票，数据将自动分类并永久保存。")
