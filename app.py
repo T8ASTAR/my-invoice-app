@@ -1,151 +1,139 @@
-import React, { useState, useMemo } from 'react';
-import { CheckCircle, AlertCircle, Download, Calendar } from 'lucide-react';
+import streamlit as st
+import pandas as pd
+import pdfplumber
+import re
+from datetime import datetime
 
-const InvoiceApp = () => {
-  // 模拟数据结构：多层级（销方 -> 购方 -> 项目 -> 发票）
-  const [invoices, setInvoices] = useState([
-    {
-      id: 'INV001',
-      seller: '毅兴',
-      buyer: '浙江省围海建设集团',
-      project: '象山海塘改造二期',
-      date: '2026-04-14',
-      amount: 74025.00,
-      paid: 0,
-    },
-    {
-      id: 'INV002',
-      seller: '旭达',
-      buyer: '浙江良和交通建设',
-      project: '象山大目湾道路工程',
-      date: '2026-02-05',
-      amount: 178594.00,
-      paid: 0,
-    }
-  ]);
+# 页面配置
+st.set_page_config(page_title="极简发票管家", layout="wide")
 
-  const [activeSeller, setActiveSeller] = useState('毅兴');
+# --- 核心逻辑：从 PDF 提取发票数据 ---
+def extract_invoice_data(file):
+    with pdfplumber.open(file) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text()
+        
+        # 使用正则表达式抓取核心字段（适配中国标准发票格式）
+        try:
+            seller = re.search(r"名称:(.*?)纳税人识别号", text, re.S).group(1).strip() if "名称:" in text else "未知销方"
+            # 简化逻辑：通常发票第二个“名称”是销方，第一个是购方
+            names = re.findall(r"名称:(.*?)\n", text)
+            buyer_name = names[0].strip() if len(names) > 0 else "未知购方"
+            seller_name = names[1].strip() if len(names) > 1 else "未知销方"
+            
+            amount = re.search(r"（小写）¥?(\d+\.\d+)", text).group(1)
+            date_str = re.search(r"开票日期:(\d{4})年(\d{2})月(\d{2})日", text)
+            invoice_date = datetime(int(date_str.group(1)), int(date_str.group(2)), int(date_str.group(3)))
+            
+            # 备注栏提取项目名称（匹配您发票中的规律）
+            project = "未识别项目"
+            memo = re.search(r"备\s*注(.*)", text, re.S)
+            if memo:
+                project_match = re.search(r"项目名称:(.*?)\n", memo.group(1))
+                if project_match:
+                    project = project_match.group(1).strip()
 
-  // 1. 逻辑优化：以购方为单位计算总额
-  const buyerSummary = useMemo(() => {
-    const filtered = invoices.filter(inv => inv.seller === activeSeller);
-    const summary = {};
-    filtered.forEach(inv => {
-      if (!summary[inv.buyer]) {
-        summary[inv.buyer] = { total: 0, paid: 0, projects: [] };
-      }
-      summary[inv.buyer].total += inv.amount;
-      summary[inv.buyer].paid += inv.paid;
-      summary[inv.buyer].projects.push(inv);
-    });
-    return summary;
-  }, [invoices, activeSeller]);
+            return {
+                "销方": seller_name,
+                "购方": buyer_name,
+                "项目": project,
+                "日期": invoice_date,
+                "应收金额": float(amount),
+                "已收金额": 0.0
+            }
+        except Exception as e:
+            st.error(f"识别解析失败，请手动检查 PDF 格式。错误: {e}")
+            return None
 
-  // 2. 自动核销处理逻辑
-  const handlePayment = (id, val) => {
-    setInvoices(prev => prev.map(inv => 
-      inv.id === id ? { ...inv, paid: parseFloat(val) || 0 } : inv
-    ));
-  };
+# --- 初始化数据存储 ---
+if 'invoice_data' not in st.session_state:
+    st.session_state.invoice_data = []
 
-  return (
-    <div className="flex h-screen bg-[#FDFCF9] font-sans text-gray-800">
-      {/* 左侧侧边栏 - 一级目录（销方） */}
-      <div className="w-20 bg-white border-r flex flex-col items-center py-8 gap-8">
-        <div className="w-10 h-10 bg-black rounded-xl flex items-center justify-center text-white font-bold">F</div>
-        {['毅兴', '旭达'].map(s => (
-          <button 
-            onClick={() => setActiveSeller(s)}
-            className={`p-3 rounded-xl transition ${activeSeller === s ? 'bg-orange-100 text-orange-600' : 'hover:bg-gray-100'}`}
-          >
-            <span className="text-xs font-bold">{s}</span>
-          </button>
-        ))}
-      </div>
+# --- 侧边栏：功能与目录 ---
+with st.sidebar:
+    st.title("📂 功能面板")
+    
+    # 1. 录入模块
+    st.subheader("1. 录入发票")
+    uploaded_file = st.file_uploader("上传 PDF 电子发票", type="pdf")
+    if uploaded_file:
+        if st.button("开始识别并存入"):
+            new_data = extract_invoice_data(uploaded_file)
+            if new_data:
+                st.session_state.invoice_data.append(new_data)
+                st.success("录入成功！")
 
-      {/* 主内容区 */}
-      <div className="flex-1 p-10 overflow-y-auto">
-        <header className="flex justify-between items-center mb-10">
-          <div>
-            <h1 className="text-2xl font-bold">发票数据归纳 / {activeSeller}</h1>
-            <p className="text-gray-400 text-sm">今日结清率: 85%</p>
-          </div>
-          <button className="flex items-center gap-2 bg-black text-white px-4 py-2 rounded-lg text-sm">
-            <Download size={16} /> 导出 CSV
-          </button>
-        </header>
+    st.divider()
+    
+    # 2. 目录切换（一级目录：销方）
+    st.subheader("2. 销方切换")
+    if st.session_state.invoice_data:
+        all_sellers = list(set(item["销方"] for item in st.session_state.invoice_data))
+        selected_seller = st.sidebar.radio("当前主体", all_sellers)
+    else:
+        selected_seller = None
+        st.info("暂无数据，请先上传发票")
 
-        {/* 二级目录：购方概览卡片 */}
-        {Object.entries(buyerSummary).map(([buyerName, data]) => (
-          <div key={buyerName} className="mb-8">
-            <div className="flex justify-between items-end mb-4">
-              <h2 className="text-lg font-bold">购方：{buyerName}</h2>
-              <p className="text-sm text-gray-500">
-                累计总额: <span className="font-mono font-bold text-black">￥{data.total.toLocaleString()}</span>
-              </p>
-            </div>
+# --- 主界面：展示与核销 ---
+if selected_seller:
+    st.title(f"📊 {selected_seller}")
+    
+    # 数据过滤
+    df = pd.DataFrame(st.session_state.invoice_data)
+    current_df = df[df["销方"] == selected_seller]
+    
+    # 二级目录：购方汇总
+    for buyer in current_df["购方"].unique():
+        with st.expander(f"🏢 购方：{buyer}", expanded=True):
+            buyer_items = current_df[current_df["购方"] == buyer]
+            
+            # 购方总计
+            b_total = buyer_items["应收金额"].sum()
+            b_paid = buyer_items["已收金额"].sum()
+            b_bal = b_total - b_paid
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("累计应收", f"¥{b_total:,.2f}")
+            m2.metric("已收总额", f"¥{b_paid:,.2f}")
+            m3.metric("待收余额", f"¥{b_bal:,.2f}", delta=-b_bal if b_bal>0 else None)
+            
+            st.write("") # 间距
+            
+            # 三级目录：项目明细
+            for idx, row in buyer_items.iterrows():
+                # 使用 container 让界面更像卡片
+                with st.container():
+                    c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                    with c1:
+                        st.markdown(f"**项目：{row['项目']}**")
+                        st.caption(f"📅 开票时间: {row['日期'].strftime('%Y-%m-%d')}")
+                    with c2:
+                        # 核销输入
+                        # 注意：这里使用 session_state 索引确保修改生效
+                        new_val = st.number_input(f"录入到账 (¥{row['应收金额']:,.2f})", 
+                                                min_value=0.0, 
+                                                value=row["已收金额"], 
+                                                key=f"input_{idx}")
+                        st.session_state.invoice_data[idx]["已收金额"] = new_val
+                    
+                    bal = row["应收金额"] - new_val
+                    with c3:
+                        if bal <= 0:
+                            st.markdown("### <span style='color:green'>✅ 已结清</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"未结：**¥{bal:,.2f}**")
+                            if (datetime.now() - row["日期"]).days > 30:
+                                st.markdown("<span style='color:red'>⚠️ 逾期预警</span>", unsafe_allow_html=True)
+                    with c4:
+                        if st.button("🗑️", key=f"del_{idx}"):
+                            st.session_state.invoice_data.pop(idx)
+                            st.rerun()
+                st.divider()
 
-            {/* 三级目录：具体发票/项目项 */}
-            <div className="grid grid-cols-1 gap-4">
-              {data.projects.map(inv => {
-                const balance = inv.amount - inv.paid;
-                const isCleared = balance <= 0;
-                const isOverdue = new Date(inv.date) < new Date(Date.now() - 30*24*60*60*1000);
-
-                return (
-                  <div key={inv.id} className={`bg-white p-6 rounded-2xl shadow-sm border transition ${isCleared ? 'opacity-60' : ''}`}>
-                    <div className="flex justify-between items-start">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="text-xs bg-gray-100 px-2 py-1 rounded text-gray-500">{inv.id}</span>
-                          <h3 className="font-bold text-gray-700">{inv.project}</h3>
-                        </div>
-                        <div className="flex gap-4 text-xs text-gray-400">
-                          <span className="flex items-center gap-1"><Calendar size={12}/> {inv.date}</span>
-                          {isOverdue && !isCleared && (
-                            <span className="flex items-center gap-1 text-red-400 font-bold"><AlertCircle size={12}/> 超期预警</span>
-                          )}
-                        </div>
-                      </div>
-
-                      <div className="flex gap-8 items-center">
-                        <div className="text-right">
-                          <p className="text-xs text-gray-400">应收金额</p>
-                          <p className="font-mono font-bold">￥{inv.amount.toLocaleString()}</p>
-                        </div>
-                        <div className="text-right">
-                          <p className="text-xs text-gray-400">到账录入</p>
-                          <input 
-                            type="number"
-                            placeholder="输入金额"
-                            className="w-24 text-right border-b focus:outline-none focus:border-black font-mono"
-                            onChange={(e) => handlePayment(inv.id, e.target.value)}
-                          />
-                        </div>
-                        <div className="w-24 text-right">
-                          <p className="text-xs text-gray-400">余额</p>
-                          <p className={`font-mono font-bold ${balance > 0 ? 'text-orange-500' : 'text-green-500'}`}>
-                            {isCleared ? '￥0.00' : `￥${balance.toLocaleString()}`}
-                          </p>
-                        </div>
-                        <div className="ml-4">
-                          {isCleared ? (
-                            <CheckCircle className="text-green-500" />
-                          ) : (
-                            <div className="w-6 h-6 border-2 border-dashed border-gray-200 rounded-full" />
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-};
-
-export default InvoiceApp;
+# --- 导出 ---
+if st.sidebar.button("📤 导出全量数据为 Excel"):
+    if st.session_state.invoice_data:
+        final_df = pd.DataFrame(st.session_state.invoice_data)
+        final_df.to_csv("发票管理台账.csv", index=False, encoding='utf-8-sig')
+        st.sidebar.success("导出成功！")
